@@ -13,12 +13,16 @@ import searchengine.repositories.IndexRepository;
 import searchengine.repositories.LemmaRepository;
 import searchengine.repositories.PageRepository;
 import searchengine.repositories.SiteRepository;
+import searchengine.util.SiteIndexing;
 
 import java.io.IOException;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
+
+import static org.aspectj.weaver.tools.cache.SimpleCacheFactory.path;
 
 @Service
 @RequiredArgsConstructor
@@ -32,7 +36,7 @@ public class IndexingServiceImpl implements IndexingService {
     private final SitesList sitesList;
 
     private ForkJoinPool forkJoinPool;
-    private volatile boolean isIndexingStopped = false;
+    private AtomicBoolean isIndexingRunning = new AtomicBoolean(false);
 
     @Override
     @Transactional
@@ -40,25 +44,41 @@ public class IndexingServiceImpl implements IndexingService {
         if (isIndexingRunning()) {
             return false;
         }
-
-        isIndexingStopped = false;
-        forkJoinPool = new ForkJoinPool();
-
-        sitesList.getSites().forEach(siteConfig -> {
-            forkJoinPool.execute(() -> {
-                Site site = createOrUpdateSite(siteConfig, SiteStatus.INDEXING);
-                try {
-                    clearExistingData(site);
-                    crawlSite(site, "/");
-                    updateSiteStatus(site, SiteStatus.INDEXED, null);
-                } catch (Exception e) {
-                    updateSiteStatus(site, SiteStatus.FAILED, e.getMessage());
-                }
-            });
-        });
-
+        for (SiteConfig siteConfig:sitesList.getSites()) {
+            Site site = createOrUpdateSite(siteConfig, SiteStatus.INDEXING);
+            clearExistingData(site);
+            ForkJoinPool forkJoinPool = new ForkJoinPool();
+            forkJoinPool.invoke(new SiteIndexing(site, path, isIndexingRunning,
+                    pageRepository, lemmaRepository, lemmaService, indexRepository));
+        }
         return true;
     }
+
+//    @Override
+//    @Transactional
+//    public boolean startIndexing() {
+//        if (isIndexingRunning()) {
+//            return false;
+//        }
+//
+//        isIndexingStopped = false;
+//        forkJoinPool = new ForkJoinPool();
+//
+//        sitesList.getSites().forEach(siteConfig -> {
+//            forkJoinPool.execute(() -> {
+//                Site site = createOrUpdateSite(siteConfig, SiteStatus.INDEXING);
+//                try {
+//                    clearExistingData(site);
+//                    crawlSite(site, "/");
+//                    updateSiteStatus(site, SiteStatus.INDEXED, null);
+//                } catch (Exception e) {
+//                    updateSiteStatus(site, SiteStatus.FAILED, e.getMessage());
+//                }
+//            });
+//        });
+//
+//        return true;
+//    }
 
     @Override
     @Transactional
@@ -67,7 +87,7 @@ public class IndexingServiceImpl implements IndexingService {
             return false;
         }
 
-        isIndexingStopped = true;
+        isIndexingRunning.set(false);
         forkJoinPool.shutdownNow();
 
         siteRepository.findAllByStatus(SiteStatus.INDEXING).forEach(site -> {
@@ -113,7 +133,8 @@ public class IndexingServiceImpl implements IndexingService {
 
     @Override
     public boolean isIndexingRunning() {
-        return forkJoinPool != null && !forkJoinPool.isTerminated();
+        return isIndexingRunning.get();
+//        forkJoinPool != null && !forkJoinPool.isTerminated();
     }
 
     private Site createOrUpdateSite(SiteConfig config, SiteStatus status) {
@@ -146,7 +167,7 @@ public class IndexingServiceImpl implements IndexingService {
     }
 
     private void crawlSite(Site site, String currentPath) {
-        if (isIndexingStopped) {
+        if (!isIndexingRunning.get()) {
             throw new RuntimeException("Индексация остановлена пользователем");
         }
 
