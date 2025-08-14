@@ -6,7 +6,7 @@ import lombok.Setter;
 import javax.persistence.*;
 
 @Entity
-@Table(name = "`index`") // Кавычки, т.к. "index" — зарезервированное слово в SQL
+@Table(name = "`index`")
 @Getter
 @Setter
 @NoArgsConstructor

@@ -11,21 +11,6 @@ import searchengine.services.StatisticsService;
 
 import java.util.Map;
 
-//@RestController
-//@RequestMapping("/api")
-//public class ApiController {
-//
-//    private final StatisticsService statisticsService;
-//
-//    public ApiController(StatisticsService statisticsService) {
-//        this.statisticsService = statisticsService;
-//    }
-//
-//    @GetMapping("/statistics")
-//    public ResponseEntity<StatisticsResponse> statistics() {
-//        return ResponseEntity.ok(statisticsService.getStatistics());
-//    }
-//}
 
 @RestController
 @RequestMapping("/api")
@@ -78,14 +63,20 @@ public class ApiController {
 
     @GetMapping("/search")
     public ResponseEntity<SearchResponse> search(
-            @RequestParam String query,
+            @RequestParam(required = false) String query,
             @RequestParam(required = false) String site,
             @RequestParam(defaultValue = "0") int offset,
             @RequestParam(defaultValue = "20") int limit) {
 
+        if (query == null || query.isBlank()) {
+            return ResponseEntity.badRequest().body(
+                    new SearchResponse(false, 0, null, "Задан пустой поисковый запрос")
+            );
+        }
+
         SearchResponse response = searchService.search(query, site, offset, limit);
         return response.isResult()
                 ? ResponseEntity.ok(response)
-                : ResponseEntity.badRequest().body(response);
+                : ResponseEntity.ok(response);
     }
 }

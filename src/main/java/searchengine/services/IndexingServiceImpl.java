@@ -1,32 +1,30 @@
 package searchengine.services;
 
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
-import org.jsoup.select.Elements;
+import org.springframework.dao.PessimisticLockingFailureException;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import searchengine.config.SiteConfig;
 import searchengine.config.SitesList;
 import searchengine.model.*;
-import searchengine.repositories.IndexRepository;
-import searchengine.repositories.LemmaRepository;
-import searchengine.repositories.PageRepository;
-import searchengine.repositories.SiteRepository;
-import searchengine.util.SiteIndexing;
+import searchengine.repositories.*;
 
 import java.io.IOException;
 import java.time.LocalDateTime;
 import java.util.*;
-import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
-import static org.aspectj.weaver.tools.cache.SimpleCacheFactory.path;
-
+@Slf4j
 @Service
 @RequiredArgsConstructor
-@Transactional
 public class IndexingServiceImpl implements IndexingService {
     private final SiteRepository siteRepository;
     private final PageRepository pageRepository;
@@ -34,74 +32,66 @@ public class IndexingServiceImpl implements IndexingService {
     private final IndexRepository indexRepository;
     private final LemmaService lemmaService;
     private final SitesList sitesList;
+    private final PlatformTransactionManager transactionManager;
 
-    private ForkJoinPool forkJoinPool;
-    private AtomicBoolean isIndexingRunning = new AtomicBoolean(false);
-
-    @Override
-    @Transactional
-    public boolean startIndexing() {
-        if (isIndexingRunning()) {
-            return false;
-        }
-        for (SiteConfig siteConfig:sitesList.getSites()) {
-            Site site = createOrUpdateSite(siteConfig, SiteStatus.INDEXING);
-            clearExistingData(site);
-            ForkJoinPool forkJoinPool = new ForkJoinPool();
-            forkJoinPool.invoke(new SiteIndexing(site, path, isIndexingRunning,
-                    pageRepository, lemmaRepository, lemmaService, indexRepository));
-        }
-        return true;
-    }
-
-//    @Override
-//    @Transactional
-//    public boolean startIndexing() {
-//        if (isIndexingRunning()) {
-//            return false;
-//        }
-//
-//        isIndexingStopped = false;
-//        forkJoinPool = new ForkJoinPool();
-//
-//        sitesList.getSites().forEach(siteConfig -> {
-//            forkJoinPool.execute(() -> {
-//                Site site = createOrUpdateSite(siteConfig, SiteStatus.INDEXING);
-//                try {
-//                    clearExistingData(site);
-//                    crawlSite(site, "/");
-//                    updateSiteStatus(site, SiteStatus.INDEXED, null);
-//                } catch (Exception e) {
-//                    updateSiteStatus(site, SiteStatus.FAILED, e.getMessage());
-//                }
-//            });
-//        });
-//
-//        return true;
-//    }
+    private ExecutorService executorService;
+    private volatile boolean indexingRunning = false;
+    private final Map<String, Future<?>> siteTasks = new ConcurrentHashMap<>();
+    private final Map<String, Object> siteLocks = new ConcurrentHashMap<>();
 
     @Override
-    @Transactional
-    public boolean stopIndexing() {
-        if (!isIndexingRunning()) {
+    public synchronized boolean startIndexing() {
+        if (indexingRunning) {
+            log.warn("Indexing already running");
             return false;
         }
 
-        isIndexingRunning.set(false);
-        forkJoinPool.shutdownNow();
+        indexingRunning = true;
+        executorService = Executors.newFixedThreadPool(sitesList.getSites().size());
 
-        siteRepository.findAllByStatus(SiteStatus.INDEXING).forEach(site -> {
-            updateSiteStatus(site, SiteStatus.FAILED, "Индексация остановлена пользователем");
+        sitesList.getSites().forEach(siteConfig -> {
+            siteLocks.putIfAbsent(siteConfig.getUrl(), new Object());
+            Future<?> future = executorService.submit(() -> indexSite(siteConfig));
+            siteTasks.put(siteConfig.getUrl(), future);
         });
 
+        log.info("Indexing started for {} sites", sitesList.getSites().size());
         return true;
     }
 
     @Override
-    @Transactional
+    public synchronized boolean stopIndexing() {
+        if (!indexingRunning) {
+            log.warn("No active indexing to stop");
+            return false;
+        }
+
+        indexingRunning = false;
+        executorService.shutdownNow();
+
+        TransactionTemplate transactionTemplate = new TransactionTemplate(transactionManager);
+        transactionTemplate.execute(status -> {
+            siteRepository.findAllByStatus(SiteStatus.INDEXING).forEach(site -> {
+                site.setStatus(SiteStatus.FAILED);
+                site.setLastError("Индексация остановлена пользователем");
+                site.setStatusTime(LocalDateTime.now());
+                siteRepository.save(site);
+            });
+            return null;
+        });
+
+        log.info("Indexing stopped by user");
+        return true;
+    }
+
+    @Override
     public boolean indexPage(String url) {
-        Optional<SiteConfig> siteConfigOpt = findSiteConfigByUrl(url);
+        Optional<SiteConfig> siteConfigOpt = sitesList.getSites().stream()
+                .filter(s -> url.startsWith(s.getUrl()))
+                .findFirst();
+
         if (siteConfigOpt.isEmpty()) {
+            log.error("Page not in config: {}", url);
             return false;
         }
 
@@ -109,54 +99,118 @@ public class IndexingServiceImpl implements IndexingService {
         Site site = siteRepository.findByUrl(config.getUrl())
                 .orElseGet(() -> createNewSite(config));
 
-        try {
-            Document doc = Jsoup.connect(url)
-                    .userAgent(sitesList.getUserAgent())
-                    .referrer(sitesList.getReferrer())
-                    .timeout(10_000)
-                    .get();
+        return executeInTransactionWithRetry(() -> {
+            try {
+                Document doc = Jsoup.connect(url)
+                        .userAgent(sitesList.getUserAgent())
+                        .referrer(sitesList.getReferrer())
+                        .timeout(10_000)
+                        .get();
 
-            String path = url.substring(site.getUrl().length());
-            pageRepository.findBySiteAndPath(site, path).ifPresent(page -> {
-                lemmaRepository.decrementFrequencyForPage(page);
-                indexRepository.deleteByPage(page);
-                pageRepository.delete(page);
-            });
+                String path = url.substring(site.getUrl().length());
+                Optional<Page> existingPage = pageRepository.findBySiteAndPath(site, path);
 
-            Page page = savePage(site, path, doc);
-            processPageContent(site, page, doc.html());
-            return true;
-        } catch (IOException e) {
-            throw new RuntimeException("Ошибка индексации страницы: " + url, e);
-        }
+                existingPage.ifPresent(this::deletePageData);
+
+                Page page = savePage(site, path, doc);
+                processPageContent(site, page, doc.html());
+
+                return true;
+            } catch (IOException e) {
+                log.error("Error indexing page: {}", url, e);
+                return false;
+            }
+        }, 3, 1000);
     }
 
     @Override
     public boolean isIndexingRunning() {
-        return isIndexingRunning.get();
-//        forkJoinPool != null && !forkJoinPool.isTerminated();
+        return indexingRunning;
     }
 
-    private Site createOrUpdateSite(SiteConfig config, SiteStatus status) {
-        Site site = siteRepository.findByUrl(config.getUrl())
-                .orElse(new Site());
+    protected void indexSite(SiteConfig config) {
+        Site site = executeInTransaction(() -> {
+            Site s = siteRepository.findByUrl(config.getUrl())
+                    .orElseGet(() -> createNewSite(config));
+            updateSiteStatus(s, SiteStatus.INDEXING, null);
+            clearSiteData(s);
+            return s;
+        });
+
+        try {
+            Queue<String> urlQueue = new ConcurrentLinkedQueue<>();
+            Set<String> visitedUrls = ConcurrentHashMap.newKeySet();
+
+            urlQueue.add("/");
+            visitedUrls.add("/");
+
+            while (!urlQueue.isEmpty() && indexingRunning) {
+                String path = urlQueue.poll();
+
+                boolean success = executeInTransactionWithRetry(() -> {
+                    try {
+                        indexPage(site, path);
+                        return true;
+                    } catch (Exception e) {
+                        log.error("Error processing page: {}", path, e);
+                        return false;
+                    }
+                }, 3, 1000);
+
+                if (!success) continue;
+
+                try {
+                    List<String> newLinks = extractLinksFromPage(site.getUrl() + path);
+                    for (String link : newLinks) {
+                        if (!visitedUrls.contains(link)) {
+                            visitedUrls.add(link);
+                            urlQueue.add(link);
+                        }
+                    }
+
+                    Thread.sleep(500); // Задержка для избежания перегрузки
+                } catch (Exception e) {
+                    log.error("Error extracting links: {}", path, e);
+                }
+            }
+
+            if (indexingRunning) {
+                executeInTransaction(() -> {
+                    updateSiteStatus(site, SiteStatus.INDEXED, null);
+                    return null;
+                });
+                log.info("Site indexed successfully: {}", site.getUrl());
+            }
+        } catch (Exception e) {
+            executeInTransaction(() -> {
+                updateSiteStatus(site, SiteStatus.FAILED, "Ошибка индексации: " + e.getMessage());
+                return null;
+            });
+            log.error("Site indexing failed: {}", site.getUrl(), e);
+        }
+    }
+
+    private List<String> extractLinksFromPage(String url) throws IOException {
+        Document doc = Jsoup.connect(url)
+                .userAgent(sitesList.getUserAgent())
+                .referrer(sitesList.getReferrer())
+                .timeout(10_000)
+                .get();
+
+        return doc.select("a[href]").stream()
+                .map(link -> link.attr("href"))
+                .filter(href -> href.startsWith("/"))
+                .distinct()
+                .collect(Collectors.toList());
+    }
+
+    private Site createNewSite(SiteConfig config) {
+        Site site = new Site();
         site.setUrl(config.getUrl());
         site.setName(config.getName());
-        site.setStatus(status);
+        site.setStatus(SiteStatus.INDEXING);
         site.setStatusTime(LocalDateTime.now());
         return siteRepository.save(site);
-    }
-
-    private void clearExistingData(Site site) {
-        indexRepository.deleteBySite(site);
-        lemmaRepository.deleteBySite(site);
-        pageRepository.deleteBySite(site);
-    }
-
-    private void deletePageData(Page page) {
-        lemmaRepository.decrementFrequencyForPage(page);
-        indexRepository.deleteByPage(page);
-        pageRepository.delete(page);
     }
 
     private void updateSiteStatus(Site site, SiteStatus status, String error) {
@@ -166,39 +220,19 @@ public class IndexingServiceImpl implements IndexingService {
         siteRepository.save(site);
     }
 
-    private void crawlSite(Site site, String currentPath) {
-        if (!isIndexingRunning.get()) {
-            throw new RuntimeException("Индексация остановлена пользователем");
-        }
+    @Transactional
+    protected void clearSiteData(Site site) {
+        indexRepository.deleteBySite(site);
+        lemmaRepository.deleteBySite(site);
+        pageRepository.deleteBySite(site);
 
-        try {
-            Thread.sleep(500); // Задержка между запросами
+        siteRepository.flush();
+    }
 
-            Document doc = Jsoup.connect(site.getUrl() + currentPath)
-                    .userAgent(sitesList.getUserAgent())
-                    .referrer(sitesList.getReferrer())
-                    .timeout(10_000)
-                    .get();
-
-            Page page = savePage(site, currentPath, doc);
-            processPageContent(site, page, doc.html());
-
-            Elements links = doc.select("a[href]");
-            List<String> newPaths = links.stream()
-                    .map(link -> link.attr("href"))
-                    .filter(href -> href.startsWith("/"))
-                    .distinct()
-                    .filter(path -> !pageRepository.existsBySiteAndPath(site, path))
-                    .collect(Collectors.toList());
-
-            newPaths.forEach(path -> crawlSite(site, path));
-
-        } catch (IOException e) {
-            throw new RuntimeException("Ошибка при загрузке страницы: " + currentPath, e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Индексация прервана");
-        }
+    private void deletePageData(Page page) {
+        indexRepository.deleteByPage(page);
+        lemmaRepository.decrementFrequencyForPage(page);
+        pageRepository.delete(page);
     }
 
     private Page savePage(Site site, String path, Document doc) {
@@ -210,11 +244,17 @@ public class IndexingServiceImpl implements IndexingService {
         return pageRepository.save(page);
     }
 
-    private void processPageContent(Site site, Page page, String html) {
+    protected void processPageContent(Site site, Page page, String html) {
         String text = Jsoup.parse(html).body().text();
         Map<String, Integer> lemmas = lemmaService.collectLemmas(text);
 
-        lemmas.forEach((lemmaText, rank) -> {
+        List<Lemma> lemmaEntities = new ArrayList<>();
+        List<Index> indexEntities = new ArrayList<>();
+
+        for (Map.Entry<String, Integer> entry : lemmas.entrySet()) {
+            String lemmaText = entry.getKey();
+            int rank = entry.getValue();
+
             Lemma lemma = lemmaRepository.findBySiteAndLemma(site, lemmaText)
                     .orElseGet(() -> {
                         Lemma newLemma = new Lemma();
@@ -225,198 +265,64 @@ public class IndexingServiceImpl implements IndexingService {
                     });
 
             lemma.setFrequency(lemma.getFrequency() + 1);
-            lemmaRepository.save(lemma);
+            lemmaEntities.add(lemma);
 
             Index index = new Index();
             index.setPage(page);
             index.setLemma(lemma);
             index.setRank(rank);
-            indexRepository.save(index);
-        });
+            indexEntities.add(index);
+        }
+
+        lemmaRepository.saveAll(lemmaEntities);
+        indexRepository.saveAll(indexEntities);
     }
 
-    private Optional<SiteConfig> findSiteConfigByUrl(String url) {
-        return sitesList.getSites().stream()
-                .filter(s -> url.startsWith(s.getUrl()))
-                .findFirst();
+    private void indexPage(Site site, String path) throws IOException {
+        Document doc = Jsoup.connect(site.getUrl() + path)
+                .userAgent(sitesList.getUserAgent())
+                .referrer(sitesList.getReferrer())
+                .timeout(10_000)
+                .get();
+
+        Optional<Page> existingPage = pageRepository.findBySiteAndPath(site, path);
+        existingPage.ifPresent(this::deletePageData);
+
+        Page page = savePage(site, path, doc);
+        processPageContent(site, page, doc.html());
     }
 
-    private Site createNewSite(SiteConfig config) {
-        Site site = new Site();
-        site.setUrl(config.getUrl());
-        site.setName(config.getName());
-        site.setStatus(SiteStatus.INDEXED);
-        site.setStatusTime(LocalDateTime.now());
-        return siteRepository.save(site);
+    private <T> T executeInTransaction(TransactionalOperation<T> operation) {
+        TransactionTemplate transactionTemplate = new TransactionTemplate(transactionManager);
+        transactionTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+        transactionTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        return transactionTemplate.execute(status -> operation.execute());
+    }
+
+    private <T> T executeInTransactionWithRetry(TransactionalOperation<T> operation, int maxAttempts, long delay) {
+        int attempt = 0;
+        while (attempt < maxAttempts) {
+            try {
+                return executeInTransaction(operation);
+            } catch (PessimisticLockingFailureException | ObjectOptimisticLockingFailureException ex) {
+                attempt++;
+                log.warn("Lock conflict detected, attempt {}/{}", attempt, maxAttempts);
+                if (attempt >= maxAttempts) {
+                    throw ex;
+                }
+                try {
+                    Thread.sleep(delay * attempt);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(ie);
+                }
+            }
+        }
+        return null; // never reached
+    }
+
+    @FunctionalInterface
+    private interface TransactionalOperation<T> {
+        T execute();
     }
 }
-
-
-//import lombok.RequiredArgsConstructor;
-//import org.jsoup.Jsoup;
-//import org.jsoup.nodes.Document;
-//import org.jsoup.select.Elements;
-//import org.springframework.stereotype.Service;
-//import searchengine.config.SiteConfig;
-//import searchengine.config.SitesList;
-//import searchengine.model.Page;
-//import searchengine.model.Site;
-//import searchengine.model.SiteStatus;
-//import searchengine.repositories.IndexRepository;
-//import searchengine.repositories.LemmaRepository;
-//import searchengine.repositories.PageRepository;
-//import searchengine.repositories.SiteRepository;
-//
-//import java.io.IOException;
-//import java.time.LocalDateTime;
-//import java.util.List;
-//import java.util.Optional;
-//import java.util.concurrent.ForkJoinPool;
-//import java.util.stream.Collectors;
-//
-//@Service
-//@RequiredArgsConstructor
-//public class IndexingServiceImpl implements IndexingService {
-//    private final SiteRepository siteRepository;
-//    private final PageRepository pageRepository;
-//    private final SitesList sitesList;
-//    private final LemmaService lemmaService;
-//    private final LemmaRepository lemmaRepository;
-//    private final IndexRepository indexRepository;
-//
-//    private ForkJoinPool forkJoinPool;
-//    private volatile boolean isIndexingStopped = false;
-//
-//    @Override
-//    public boolean startIndexing() {
-//        if (isIndexingRunning()) {
-//            return false;
-//        }
-//
-//        isIndexingStopped = false;
-//        forkJoinPool = new ForkJoinPool();
-//
-//        sitesList.getSites().forEach(siteConfig -> {
-//            forkJoinPool.execute(() -> indexSite(siteConfig));
-//        });
-//
-//        return true;
-//    }
-//
-//    @Override
-//    public boolean stopIndexing() {
-//        if (!isIndexingRunning()) {
-//            return false;
-//        }
-//
-//        isIndexingStopped = true;
-//        forkJoinPool.shutdownNow();
-//
-//        siteRepository.findAllByStatus(SiteStatus.INDEXING).forEach(site -> {
-//            site.setStatus(SiteStatus.FAILED);
-//            site.setLastError("Индексация остановлена пользователем");
-//            site.setStatusTime(LocalDateTime.now());
-//            siteRepository.save(site);
-//        });
-//
-//        return true;
-//    }
-//
-//
-//    @Override
-//    public boolean indexPage(String url) {
-//        // Проверяем, принадлежит ли URL сайтам из конфигурации
-//        Optional<SiteConfig> siteConfigOpt = sitesList.getSites().stream()
-//                .filter(s -> url.startsWith(s.getUrl()))
-//                .findFirst();
-//
-//        if (siteConfigOpt.isEmpty()) {
-//            return false;
-//        }
-//
-//        SiteConfig config = siteConfigOpt.get();
-//        Site site = siteRepository.findByUrl(config.getUrl())
-//                .orElseGet(() -> {
-//                    Site newSite = new Site();
-//                    newSite.setUrl(config.getUrl());
-//                    newSite.setName(config.getName());
-//                    newSite.setStatus(SiteStatus.INDEXED);
-//                    return siteRepository.save(newSite);
-//                });
-//
-//        try {
-//            Document doc = Jsoup.connect(url)
-//                    .userAgent(sitesList.getUserAgent())
-//                    .get();
-//
-//            indexPage(site, url.substring(site.getUrl().length()), doc.html());
-//            return true;
-//        } catch (IOException e) {
-//            throw new RuntimeException("Ошибка индексации страницы", e);
-//        }
-//    }
-//
-//    @Override
-//    public boolean isIndexingRunning() {
-//        return forkJoinPool != null && !forkJoinPool.isTerminated();
-//    }
-//
-//    private void indexSite(SiteConfig siteConfig) {
-//        Site site = new Site();
-//        site.setUrl(siteConfig.getUrl());
-//        site.setName(siteConfig.getName());
-//        site.setStatus(SiteStatus.INDEXING);
-//        site.setStatusTime(LocalDateTime.now());
-//        site = siteRepository.save(site);
-//
-//        try {
-//            crawlSite(site, "/");
-//            site.setStatus(SiteStatus.INDEXED);
-//        } catch (Exception e) {
-//            site.setStatus(SiteStatus.FAILED);
-//            site.setLastError(e.getMessage());
-//        } finally {
-//            site.setStatusTime(LocalDateTime.now());
-//            siteRepository.save(site);
-//        }
-//    }
-//
-//    private void crawlSite(Site site, String currentPath) {
-//        if (isIndexingStopped) {
-//            throw new RuntimeException("Индексация остановлена пользователем");
-//        }
-//
-//        try {
-//            Thread.sleep(500);
-//
-//            Document doc = Jsoup.connect(site.getUrl() + currentPath)
-//                    .userAgent(sitesList.getUserAgent())
-//                    .referrer(sitesList.getReferrer())
-//                    .timeout(10_000)
-//                    .get();
-//
-//            Page page = new Page();
-//            page.setSite(site);
-//            page.setPath(currentPath);
-//            page.setCode(doc.connection().response().statusCode());
-//            page.setContent(doc.html());
-//            pageRepository.save(page);
-//
-//            Elements links = doc.select("a[href]");
-//            List<String> newPaths = links.stream()
-//                    .map(link -> link.attr("href"))
-//                    .filter(href -> href.startsWith("/"))
-//                    .distinct()
-//                    .filter(path -> !pageRepository.existsBySiteAndPath(site, path))
-//                    .collect(Collectors.toList());
-//
-//            newPaths.forEach(path -> crawlSite(site, path));
-//
-//        } catch (IOException e) {
-//            throw new RuntimeException("Ошибка при загрузке страницы: " + currentPath, e);
-//        } catch (InterruptedException e) {
-//            Thread.currentThread().interrupt();
-//            throw new RuntimeException("Индексация прервана");
-//        }
-//    }
-//}

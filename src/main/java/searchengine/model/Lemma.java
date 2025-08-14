@@ -23,5 +23,5 @@ public class Lemma {
     private String lemma;
 
     @Column(nullable = false)
-    private int frequency; // Количество страниц, где встречается лемма
+    private int frequency;
 }
