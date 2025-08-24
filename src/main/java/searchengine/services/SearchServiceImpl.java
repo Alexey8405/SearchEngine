@@ -83,54 +83,110 @@ public class SearchServiceImpl implements SearchService {
                 .filter(site -> site.getStatus() == SiteStatus.INDEXED);
     }
 
-        private List<Lemma> filterLemmas(Set<String> lemmaStrings, Optional<Site> siteOpt) {
-        List<Lemma> lemmas = siteOpt.isPresent()
-                ? lemmaRepository.findBySiteAndLemmaIn(siteOpt.get(), lemmaStrings)
-                : lemmaRepository.findByLemmaIn(lemmaStrings);
+    private List<Lemma> filterLemmas(Set<String> lemmaStrings, Optional<Site> siteOpt) {
+        List<Lemma> lemmas;
+
+        if (siteOpt.isPresent()) {
+            lemmas = lemmaRepository.findBySiteAndLemmaIn(siteOpt.get(), lemmaStrings);
+        } else {
+            lemmas = lemmaRepository.findByLemmaIn(lemmaStrings);
+        }
 
         if (lemmas.isEmpty()) {
             return Collections.emptyList();
         }
 
-        long totalPages;
         if (siteOpt.isPresent()) {
-            totalPages = pageRepository.countBySite(siteOpt.get());
-        } else {
-            totalPages = pageRepository.count();
+            long totalPages = pageRepository.countBySite(siteOpt.get());
+            long threshold = (long) (totalPages * HIGH_FREQUENCY_THRESHOLD);
+
+            List<Lemma> filtered = lemmas.stream()
+                    .filter(l -> l.getFrequency() <= threshold)
+                    .collect(Collectors.toList());
+
+            if (filtered.isEmpty()) {
+                Lemma rarest = lemmas.stream()
+                        .min(Comparator.comparingInt(Lemma::getFrequency))
+                        .orElse(lemmas.get(0));
+                return Collections.singletonList(rarest);
+            }
+            return filtered.stream()
+                    .sorted(Comparator.comparingInt(Lemma::getFrequency))
+                    .collect(Collectors.toList());
         }
 
-        long threshold = (long) (totalPages * HIGH_FREQUENCY_THRESHOLD);
-
         return lemmas.stream()
-                .filter(l -> l.getFrequency() <= threshold)
                 .sorted(Comparator.comparingInt(Lemma::getFrequency))
                 .collect(Collectors.toList());
     }
+
 
     private List<Page> findRelevantPages(List<Lemma> lemmas, Optional<Site> siteOpt) {
         if (lemmas.isEmpty()) {
             return Collections.emptyList();
         }
-
-        Lemma firstLemma = lemmas.get(0);
-        List<Page> pages = indexRepository.findPagesByLemma(firstLemma);
-
+        // Для поиска с указанием сайта
         if (siteOpt.isPresent()) {
             Site site = siteOpt.get();
+            // Фильтруем леммы ТОЛЬКО для указанного сайта
+            List<Lemma> siteLemmas = lemmas.stream()
+                    .filter(lemma -> lemma.getSite().getId() == site.getId())
+                    .sorted(Comparator.comparingInt(Lemma::getFrequency))
+                    .collect(Collectors.toList());
+
+            if (siteLemmas.isEmpty()) {
+                return Collections.emptyList();
+            }
+
+            Lemma firstLemma = siteLemmas.get(0);
+            List<Page> pages = indexRepository.findPagesByLemma(firstLemma);
+
+            // Фильтруем страницы ТОЛЬКО для указанного сайта
             pages = pages.stream()
                     .filter(p -> p.getSite().getId() == site.getId())
                     .collect(Collectors.toList());
-        }
 
-        for (int i = 1; i < lemmas.size() && !pages.isEmpty(); i++) {
-            Lemma lemma = lemmas.get(i);
-            Set<Page> lemmaPages = new HashSet<>(indexRepository.findPagesByLemma(lemma));
-            pages = pages.stream()
-                    .filter(lemmaPages::contains)
-                    .collect(Collectors.toList());
+            for (int i = 1; i < siteLemmas.size() && !pages.isEmpty(); i++) {
+                Lemma lemma = siteLemmas.get(i);
+                Set<Page> lemmaPages = new HashSet<>(indexRepository.findPagesByLemma(lemma));
+                pages = pages.stream()
+                        .filter(lemmaPages::contains)
+                        .collect(Collectors.toList());
+            }
+            return pages;
         }
+        // Для поиска по всем сайтам
+        else {
+            // Группируем леммы по сайтам
+            Map<Site, List<Lemma>> lemmasBySite = lemmas.stream()
+                    .collect(Collectors.groupingBy(Lemma::getSite));
 
-        return pages;
+            List<Page> relevantPages = new ArrayList<>();
+
+            for (Map.Entry<Site, List<Lemma>> entry : lemmasBySite.entrySet()) {
+                Site site = entry.getKey();
+                List<Lemma> siteLemmas = entry.getValue();
+                siteLemmas.sort(Comparator.comparingInt(Lemma::getFrequency));
+
+                Lemma firstLemma = siteLemmas.get(0);
+                List<Page> pages = indexRepository.findPagesByLemma(firstLemma);
+
+                // Фильтруем страницы по текущему сайту
+                pages = pages.stream()
+                        .filter(p -> p.getSite().getId() == site.getId())
+                        .collect(Collectors.toList());
+
+                for (int i = 1; i < siteLemmas.size() && !pages.isEmpty(); i++) {
+                    Lemma lemma = siteLemmas.get(i);
+                    Set<Page> lemmaPages = new HashSet<>(indexRepository.findPagesByLemma(lemma));
+                    pages = pages.stream()
+                            .filter(lemmaPages::contains)
+                            .collect(Collectors.toList());
+                }
+                relevantPages.addAll(pages);
+            }
+            return relevantPages;
+        }
     }
 
     private Map<Page, Float> calculateRelevance(List<Page> pages, List<Lemma> lemmas) {
@@ -148,7 +204,6 @@ public class SearchServiceImpl implements SearchService {
                 maxRelevance = relevance;
             }
         }
-
         // Нормализация только если есть страницы с релевантностью > 0
         if (maxRelevance > 0f) {
             for (Page page : pages) {
@@ -194,26 +249,26 @@ public class SearchServiceImpl implements SearchService {
             );
         }
     }
-
     private String createSnippet(String text, Set<String> queryLemmas) {
         String lowerText = text.toLowerCase();
         List<String> fragments = new ArrayList<>();
+        Set<String> foundLemmas = new HashSet<>();
 
+        // Ищем все вхождения лемм
         for (String lemma : queryLemmas) {
             String lowerLemma = lemma.toLowerCase();
             int idx = lowerText.indexOf(lowerLemma);
-
-            if (idx >= 0) {
+            while (idx >= 0) {
                 int start = Math.max(0, idx - 30);
-                int end = Math.min(text.length(), idx + lemma.length() + 30);
-
-                String fragment = text.substring(start, end);
-                fragment = highlightLemmas(fragment, queryLemmas);
-                fragments.add(fragment);
+                int end = Math.min(text.length(), idx + lowerLemma.length() + 30);
+                fragments.add(text.substring(start, end));
+                foundLemmas.add(lemma);
+                idx = lowerText.indexOf(lowerLemma, end);
             }
         }
 
-        if (fragments.isEmpty()) {
+        // Если не найдены все леммы, используем начало текста
+        if (foundLemmas.size() < queryLemmas.size()) {
             return text.substring(0, Math.min(SNIPPET_LENGTH, text.length())) + "...";
         }
 

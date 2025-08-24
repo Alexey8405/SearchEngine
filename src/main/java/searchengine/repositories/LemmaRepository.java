@@ -13,6 +13,7 @@ import java.util.Optional;
 import java.util.Set;
 
 public interface LemmaRepository extends JpaRepository<Lemma, Integer> {
+
     // Для SearchServiceImpl
     @Query("SELECT l FROM Lemma l WHERE l.site = :site AND l.lemma IN :lemmas")
     List<Lemma> findBySiteAndLemmaIn(@Param("site") Site site, @Param("lemmas") Set<String> lemmas);
@@ -38,6 +39,9 @@ public interface LemmaRepository extends JpaRepository<Lemma, Integer> {
 
     @Query("SELECT COUNT(l) FROM Lemma l WHERE l.site = :site")
     int countBySite(@Param("site") Site site);
+
+    @Query("SELECT l FROM Lemma l WHERE l.site = :site AND l.lemma IN :lemmas ORDER BY l.frequency ASC")
+    List<Lemma> findBySiteAndLemmaInOrderByFrequencyAsc(@Param("site") Site site, @Param("lemmas") Set<String> lemmas);
 
     long count();
 }

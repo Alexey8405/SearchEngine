@@ -50,7 +50,7 @@ public class StatisticsServiceImpl implements StatisticsService {
                 site.getStatus().name(),
                 site.getStatusTime().atZone(ZoneId.systemDefault()).toEpochSecond(),
                 site.getLastError(),
-                pageRepository.countBySite(site),
+                (int) pageRepository.countBySite(site),
                 lemmaRepository.countBySite(site)
         );
     }

@@ -13,6 +13,11 @@ import java.util.Optional;
 
 public interface IndexRepository extends JpaRepository<Index, Integer> {
     // Для SearchServiceImpl
+    // Для поиска по лемме и сайту
+    @Query("SELECT i.page FROM Index i WHERE i.lemma = :lemma AND i.page.site = :site")
+    List<Page> findPagesByLemmaAndSite(@Param("lemma") Lemma lemma, @Param("site") Site site);
+
+    // Для поиска по лемме (без указания сайта)
     @Query("SELECT i.page FROM Index i WHERE i.lemma = :lemma")
     List<Page> findPagesByLemma(@Param("lemma") Lemma lemma);
 
