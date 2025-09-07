@@ -21,6 +21,7 @@ public interface IndexRepository extends JpaRepository<Index, Integer> {
     @Query("SELECT i.page FROM Index i WHERE i.lemma = :lemma")
     List<Page> findPagesByLemma(@Param("lemma") Lemma lemma);
 
+    // Для поиска "веса" слова на конкретной странице
     @Query("SELECT i.rank FROM Index i WHERE i.page = :page AND i.lemma = :lemma")
     Optional<Float> findRankByPageAndLemma(
             @Param("page") Page page,
@@ -28,10 +29,12 @@ public interface IndexRepository extends JpaRepository<Index, Integer> {
     );
 
     // Для IndexingServiceImpl
+    // Для удаления всех связей для конкретной страницы (для очистки данных при переиндексации/обновления страницы)
     @Modifying
     @Query("DELETE FROM Index i WHERE i.page = :page")
     void deleteByPage(@Param("page") Page page);
 
+    // Для удаления всех связей для всех страниц сайта (для очистки данных при полной переиндексации сайта)
     @Modifying
     @Query("DELETE FROM Index i WHERE i.page IN (SELECT p FROM Page p WHERE p.site = :site)")
     void deleteBySite(@Param("site") Site site);

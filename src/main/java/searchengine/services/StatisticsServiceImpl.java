@@ -21,6 +21,9 @@ public class StatisticsServiceImpl implements StatisticsService {
     private final LemmaRepository lemmaRepository;
     private final IndexingService indexingService;
 
+    // Реализация метода getStatistics из интерфейса StatisticsService
+    // @Transactional(readOnly = true) - выполняется в транзакции только для чтения
+    // readOnly = true оптимизирует производительность для запросов только на чтение
     @Override
     @Transactional(readOnly = true)
     public StatisticsResponse getStatistics() {
@@ -33,8 +36,8 @@ public class StatisticsServiceImpl implements StatisticsService {
             );
 
             List<DetailedStatisticsItem> detailed = siteRepository.findAll().stream()
-                    .map(this::convertToDetailedItem)
-                    .collect(Collectors.toList());
+                    .map(this::convertToDetailedItem) // Преобразуем каждый сайт в DetailedStatisticsItem
+                    .collect(Collectors.toList()); // Собираем в список
 
             return new StatisticsResponse(true, new StatisticsData(total, detailed));
         } catch (Exception e) {
@@ -43,15 +46,16 @@ public class StatisticsServiceImpl implements StatisticsService {
         }
     }
 
+    // Метод для преобразования объекта Site в DetailedStatisticsItem
     private DetailedStatisticsItem convertToDetailedItem(Site site) {
         return new DetailedStatisticsItem(
                 site.getUrl(),
                 site.getName(),
                 site.getStatus().name(),
-                site.getStatusTime().atZone(ZoneId.systemDefault()).toEpochSecond(),
-                site.getLastError(),
-                (int) pageRepository.countBySite(site),
-                lemmaRepository.countBySite(site)
+                site.getStatusTime().atZone(ZoneId.systemDefault()).toEpochSecond(), // Время статуса в секундах
+                site.getLastError(), // Текст последней ошибки (если есть)
+                (int) pageRepository.countBySite(site), // Количество страниц на сайте
+                lemmaRepository.countBySite(site) // Количество лемм на сайте
         );
     }
 }

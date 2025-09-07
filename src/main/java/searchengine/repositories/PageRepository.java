@@ -20,10 +20,12 @@ public interface PageRepository extends JpaRepository<Page, Integer> {
     @Query("SELECT p FROM Page p WHERE p.site = :site AND p.path = :path")
     Optional<Page> findBySiteAndPath(@Param("site") Site site, @Param("path") String path);
 
+    // Проверка существования страницы
     @Query("SELECT CASE WHEN COUNT(p) > 0 THEN true ELSE false END FROM Page p WHERE p.site = :site AND p.path = :path")
     boolean existsBySiteAndPath(@Param("site") Site site, @Param("path") String path);
 
     // Для IndexingServiceImpl
+    // Удаление всех страниц сайта (перед повторной индексацией сайта)
     @Modifying
     @Transactional
     @Query("DELETE FROM Page p WHERE p.site = :site")
