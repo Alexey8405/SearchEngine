@@ -11,7 +11,6 @@ import searchengine.model.*;
 import searchengine.repositories.*;
 
 import java.util.*;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -67,14 +66,41 @@ public class SearchServiceImpl implements SearchService {
 
             // Вычисление релевантности для каждой страницы
             Map<Page, Float> pageRelevance = calculateRelevance(relevantPages, filteredLemmas);
-            // Подготовка результатов для ответа
-            List<SearchResult> results = prepareResults(pageRelevance, queryLemmas.keySet(), offset, limit);
 
-            return successResponse(results);
+            // Получаем ВСЕ результаты для подсчета общего количества
+            List<SearchResult> allResults = prepareAllResults(pageRelevance, queryLemmas.keySet());
+            int totalCount = allResults.size();
+
+            // Получаем только нужную страницу для отображения
+            List<SearchResult> paginatedResults = paginateResults(allResults, offset, limit);
+
+            return successResponse(totalCount, paginatedResults); // Передаем общее количество
+
         } catch (Exception e) {
             log.error("Search error", e);
             return errorResponse("Ошибка при выполнении поиска");
         }
+    }
+
+    // Подготовка всех результатов (без пагинации)
+    private List<SearchResult> prepareAllResults(Map<Page, Float> pageRelevance, Set<String> queryLemmas) {
+        return pageRelevance.entrySet().stream()
+                .sorted(Map.Entry.<Page, Float>comparingByValue().reversed())
+                .map(entry -> createSearchResult(entry.getKey(), entry.getValue(), queryLemmas))
+                .collect(Collectors.toList());
+    }
+
+    // Пагинация результатов
+    private List<SearchResult> paginateResults(List<SearchResult> allResults, int offset, int limit) {
+        return allResults.stream()
+                .skip(offset)
+                .limit(limit)
+                .collect(Collectors.toList());
+    }
+
+    // Создание успешного ответа с общим количеством
+    private SearchResponse successResponse(int totalCount, List<SearchResult> results) {
+        return new SearchResponse(true, totalCount, results, null);
     }
 
     // Безопасное извлечение лемм из запроса (с обработкой исключений)
@@ -122,7 +148,7 @@ public class SearchServiceImpl implements SearchService {
             // Фильтруем леммы, которые встречаются слишком часто
             List<Lemma> filtered = lemmas.stream()
                     .filter(l -> l.getFrequency() <= threshold)
-                    .collect(Collectors.toList());
+                    .toList();
 
             // Если все леммы слишком частые возвращаем самую редкую
             if (filtered.isEmpty()) {
@@ -155,7 +181,7 @@ public class SearchServiceImpl implements SearchService {
             List<Lemma> siteLemmas = lemmas.stream()
                     .filter(lemma -> lemma.getSite().getId() == site.getId())
                     .sorted(Comparator.comparingInt(Lemma::getFrequency))
-                    .collect(Collectors.toList());
+                    .toList();
 
             if (siteLemmas.isEmpty()) {
                 return Collections.emptyList();
@@ -288,41 +314,113 @@ public class SearchServiceImpl implements SearchService {
     private String createSnippet(String text, Set<String> queryLemmas) {
         String lowerText = text.toLowerCase();
         List<String> fragments = new ArrayList<>(); // Список для хранения найденных фрагментов текста
-        Set<String> foundLemmas = new HashSet<>(); // Множество для отслеживания, какие леммы мы нашли
+        Set<String> foundWords = findMatchingWords(text, queryLemmas); // Ищем все слова, которые содержат леммы из запроса
 
-        // Ищем все вхождения лемм в тексте
-        for (String lemma : queryLemmas) {
-            String lowerLemma = lemma.toLowerCase();
-            int idx = lowerText.indexOf(lowerLemma); // Ищем ПЕРВОЕ вхождение леммы в тексте (-1, если не найдено)
-            // Для каждого вхождения добавляем фрагмент текста вокруг
-            while (idx >= 0) {
-                int start = Math.max(0, idx - 30); // Начинаем фрагмент за 30 символов ДО найденной леммы (0, чтобы не выйти за начало текста, если лемма в начале)
-                int end = Math.min(text.length(), idx + lowerLemma.length() + 30); // Заканчиваем фрагмент через 30 символов ПОСЛЕ леммы (Math.min(text.length(), ...) — чтобы не выйти за конец текста)
-                fragments.add(text.substring(start, end)); // Вырезаем фрагмент из ОРИГИНАЛЬНОГО текста (с сохранением регистра) и добавляем фрагмент в список
-                foundLemmas.add(lemma); // Отмечаем, что эту лемму мы нашли
-                idx = lowerText.indexOf(lowerLemma, end); // Ищем СЛЕДУЮЩЕЕ вхождение леммы, начиная с позиции end
-            }
-        }
-
-        // Если не найдены все леммы, используем начало текста длиной SNIPPET_LENGTH или меньше, если текст короткий, добавляем многоточие в конце
-        if (foundLemmas.size() < queryLemmas.size()) {
+        if (foundWords.isEmpty()) {
+            // Если не нашли совпадений, возвращаем начало текста
             return text.substring(0, Math.min(SNIPPET_LENGTH, text.length())) + "...";
         }
 
+        // Ищем вхождения оригинальных форм слов в тексте
+        for (String wordForm : foundWords) {
+            String lowerWord = wordForm.toLowerCase();
+            int idx = lowerText.indexOf(lowerWord);// Ищем ПЕРВОЕ вхождение слова в тексте (-1, если не найдено)
+            // Для каждого вхождения добавляем фрагмент текста вокруг
+            while (idx >= 0 && fragments.size() < 3) {
+                int start = Math.max(0, idx - 50); // Начинаем фрагмент за 50 символов ДО найденного слова (0, чтобы не выйти за начало текста, если слово в начале)
+                int end = Math.min(text.length(), idx + wordForm.length() + 50); // Заканчиваем фрагмент через 50 символов ПОСЛЕ слова (Math.min(text.length(), ...) — чтобы не выйти за конец текста)
+
+                // Сохраняем оригинальный фрагмент текста (с правильным регистром)
+                String fragment = text.substring(start, end); // Вырезаем фрагмент из ОРИГИНАЛЬНОГО текста (с сохранением регистра)
+                fragments.add(fragment); // Добавляем фрагмент в список
+                idx = lowerText.indexOf(lowerWord, end);
+            }
+            if (fragments.size() >= 3) break;
+        }
+
         String snippet = "..." + String.join(" ... ", fragments) + "...";
-        return highlightLemmas(snippet, queryLemmas);
+        // Выделяем слова ДО объединения в сниппет
+        return highlightWordsInFragments(fragments, foundWords);
     }
 
-    // Подсветка лемм в тексте (обертывание в теги <b>)
-    private String highlightLemmas(String text, Set<String> queryLemmas) {
-        String result = text; // Берем оригинальный текст
-        for (String lemma : queryLemmas) { // Перебираем КАЖДУЮ лемму из поискового запроса
-            result = result.replaceAll( // Для каждой леммы делаем замену в тексте
-                    "(?i)(" + Pattern.quote(lemma) + ")", // (?i) — флаг "case insensitive" (игнорировать регистр) + экранируем спецсимволы
-                    "<b>$1</b>" // $1 - ссылка на ПЕРВУЮ найденную лемму
-            );
+    // Поиск слов в тексте, которые содержат леммы из запроса (находим только чистые слова без пунктуации)
+    private Set<String> findMatchingWords(String text, Set<String> queryLemmas) {
+        Set<String> foundWords = new HashSet<>();
+        String[] words = text.split("\\s+");
+
+        for (String originalWord : words) {
+            // Очищаем слово от пунктуации по краям
+            String cleanWord = originalWord.replaceAll("^[^a-zA-Zа-яё]+|[^a-zA-Zа-яё]+$", "").toLowerCase();
+            if (cleanWord.length() < 3) continue;
+
+            // Проверяем, содержит ли слово любую из лемм запроса
+            for (String lemma : queryLemmas) {
+                String cleanLemma = lemma.toLowerCase();
+                if (cleanWord.contains(cleanLemma)) {
+                    // Сохраняем очищенное слово для выделения
+                    foundWords.add(cleanWord);
+                    break;
+                }
+            }
         }
-        return result;
+        return foundWords;
+    }
+
+    // Выделение слов в отдельных фрагментах до объединения (выделяем только чистые слова без пунктуации)
+    private String highlightWordsInFragments(List<String> fragments, Set<String> wordsToHighlight) {
+        List<String> highlightedFragments = new ArrayList<>();
+
+        for (String fragment : fragments) {
+            String highlightedFragment = fragment;
+
+            for (String cleanWord : wordsToHighlight) {
+                // Выделяем слово с учетом регистра из оригинального фрагмента
+                highlightedFragment = highlightCleanWord(highlightedFragment, cleanWord);
+            }
+
+            highlightedFragments.add(highlightedFragment);
+        }
+
+        return "..." + String.join(" ... ", highlightedFragments) + "...";
+    }
+
+    // Выделение чистого слова с поиском по разным формам регистра
+    private String highlightCleanWord(String text, String cleanWord) {
+        try {
+            // Ищем слово в разных вариантах регистра
+            String lowerText = text.toLowerCase();
+            String lowerCleanWord = cleanWord.toLowerCase();
+            int idx = lowerText.indexOf(lowerCleanWord);
+
+            while (idx >= 0) {
+                // Проверяем, что это отдельное слово (не часть другого слова)
+                boolean isWordStart = (idx == 0) || !Character.isLetterOrDigit(text.charAt(idx - 1));
+                boolean isWordEnd = (idx + lowerCleanWord.length() == text.length()) ||
+                        !Character.isLetterOrDigit(text.charAt(idx + lowerCleanWord.length()));
+
+                if (isWordStart && isWordEnd) {
+                    // Находим точное слово с оригинальным регистром
+                    String exactWord = text.substring(idx, idx + lowerCleanWord.length());
+
+                    // Заменяем только если это не уже выделенное слово
+                    if (!exactWord.startsWith("<b>")) {
+                        String before = text.substring(0, idx);
+                        String after = text.substring(idx + exactWord.length());
+                        text = before + "<b>" + exactWord + "</b>" + after;
+
+                        // Обновляем lowerText после изменения
+                        lowerText = text.toLowerCase();
+                    }
+                }
+
+                // Ищем следующее вхождение
+                idx = lowerText.indexOf(lowerCleanWord, idx + lowerCleanWord.length() + 7); // +7 для "<b></b>"
+            }
+        } catch (Exception e) {
+            log.debug("Error highlighting clean word: {}", cleanWord, e);
+        }
+
+        return text;
     }
 
     // Создание ответа с ошибкой

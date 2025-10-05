@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -35,19 +36,18 @@ public class IndexingServiceImpl implements IndexingService {
     private final PlatformTransactionManager transactionManager; // Для управления транзакциями
 
     private ExecutorService executorService; // Для управления пулом потоков, не final, устанавливается во время работы
-    private volatile boolean indexingRunning = false; // Флаг (запущена ли индексация?)
+    private final AtomicBoolean indexingRunning = new AtomicBoolean(false);; // Флаг (запущена ли индексация?) + атомик для потокобезопасности
     private final Map<String, Future<?>> siteTasks = new ConcurrentHashMap<>(); // Мапа для отслеживания задач по сайтам (Ключ: URL сайта, Значение: Future<?> - объект представляющий задачу)
     private final Map<String, Object> siteLocks = new ConcurrentHashMap<>(); // Мапа для блокировок по сайтам (Ключ: URL сайта, Значение: Object - объект для синхронизации)
 
     // synchronized - только один поток может выполнять этот метод одновременно
     @Override
     public synchronized boolean startIndexing() {
-        if (indexingRunning) {
+        // Используем compareAndSet для атомарной проверки и установки
+        if (!indexingRunning.compareAndSet(false, true)) {
             log.warn("Indexing already running");
             return false;
         }
-
-        indexingRunning = true;
         // Создаем пул потоков с количеством потоков = количеству сайтов
         executorService = Executors.newFixedThreadPool(sitesList.getSites().size());
 
@@ -66,14 +66,16 @@ public class IndexingServiceImpl implements IndexingService {
 
     @Override
     public synchronized boolean stopIndexing() {
-        if (!indexingRunning) {
+        // ИСПРАВЛЕНО: Используем getAndSet для атомарной проверки и установки
+        if (!indexingRunning.getAndSet(false)) {
             log.warn("No active indexing to stop");
             return false;
         }
 
-        indexingRunning = false;
         // Остановка всех потоков
-        executorService.shutdownNow();
+        if (executorService != null) {
+            executorService.shutdownNow();
+        }
 
         // Создание TransactionTemplate для выполнения кода в транзакции
         TransactionTemplate transactionTemplate = new TransactionTemplate(transactionManager);
@@ -109,7 +111,7 @@ public class IndexingServiceImpl implements IndexingService {
 
         // Выполняем индексацию страницы в транзакции с повторами
         // executeInTransactionWithRetry - метод для безопасного выполнения
-        return executeInTransactionWithRetry(() -> {
+        return Boolean.TRUE.equals(executeInTransactionWithRetry(() -> {
             try {
                 // Скачиваем страницу с помощью Jsoup
                 Document doc = Jsoup.connect(url)
@@ -135,12 +137,12 @@ public class IndexingServiceImpl implements IndexingService {
                 // Возвращаем false - индексация не удалась
                 return false;
             }
-        }, 3, 1000); // 3 попытки с задержкой 1000 мс
+        }, 3, 1000)); // 3 попытки с задержкой 1000 мс
     }
 
     @Override
     public boolean isIndexingRunning() {
-        return indexingRunning; // Возвращает значение флага
+        return indexingRunning.get(); // Возвращает значение флага, используем get() для AtomicBoolean
     }
 
     // Индексация одного сайта
@@ -166,11 +168,13 @@ public class IndexingServiceImpl implements IndexingService {
             visitedUrls.add("/");
 
             // Пока есть URL в очереди и индексация не остановлена
-            while (!urlQueue.isEmpty() && indexingRunning) {
+            while (!urlQueue.isEmpty() && indexingRunning.get()) {
                 String path = urlQueue.poll(); // Берем следующий URL из очереди
 
                 // Пытаемся проиндексировать страницу в транзакции с повторами
-                boolean success = executeInTransactionWithRetry(() -> {
+                // Индексируем страницу
+                // Если ошибка - логируем и возвращаем false
+                boolean success = Boolean.TRUE.equals(executeInTransactionWithRetry(() -> {
                     try {
                         indexPage(site, path); // Индексируем страницу
                         return true;
@@ -178,7 +182,7 @@ public class IndexingServiceImpl implements IndexingService {
                         log.error("Error processing page: {}", path, e); // Если ошибка - логируем и возвращаем false
                         return false;
                     }
-                }, 3, 1000); // 3 попытки с задержкой 1000 мс
+                }, 3, 1000)); // 3 попытки с задержкой 1000 мс
 
                 if (!success) continue; // Если не удалось обработать страницу, переходим к следующей
 
@@ -200,7 +204,7 @@ public class IndexingServiceImpl implements IndexingService {
             }
 
             // Если индексация не была остановлена вручную
-            if (indexingRunning) {
+            if (indexingRunning.get()) {
                 // Выполнение в транзакции: обновляем статус на INDEXED
                 executeInTransaction(() -> {
                     updateSiteStatus(site, SiteStatus.INDEXED, null);

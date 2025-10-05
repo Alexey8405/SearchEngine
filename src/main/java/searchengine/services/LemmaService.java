@@ -2,37 +2,49 @@ package searchengine.services;
 
 import lombok.extern.slf4j.Slf4j;
 import org.apache.lucene.morphology.LuceneMorphology;
+import org.apache.lucene.morphology.english.EnglishLuceneMorphology;
 import org.apache.lucene.morphology.russian.RussianLuceneMorphology;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
 import java.util.*;
-
+import java.util.regex.Pattern;
 
 @Slf4j
 @Service
 public class LemmaService {
-    private final LuceneMorphology luceneMorph;
-    // Части речи, которые исключаются из индексации
-    private static final Set<String> EXCLUDE_POS = Set.of("МЕЖД", "ПРЕДЛ", "СОЮЗ", "ЧАСТ", "МС");
+    private final LuceneMorphology russianMorph;
+    private final LuceneMorphology englishMorph;
+
+    // Части речи, которые исключаются из индексации (для русского)
+    private static final Set<String> RUSSIAN_EXCLUDE_POS = Set.of("МЕЖД", "ПРЕДЛ", "СОЮЗ", "ЧАСТ", "МС");
+    // Части речи, которые исключаются из индексации (для английского)
+    private static final Set<String> ENGLISH_EXCLUDE_POS = Set.of("CONJ", "PREP", "ARTICLE", "PART", "INT");
+
     private static final int MIN_LEMMA_LENGTH = 3;
+    // Регулярные выражения для определения языка
+    private static final Pattern RUSSIAN_PATTERN = Pattern.compile("[а-яё]", Pattern.CASE_INSENSITIVE);
+    private static final Pattern ENGLISH_PATTERN = Pattern.compile("[a-z]", Pattern.CASE_INSENSITIVE);
 
     public LemmaService() {
-        // Временная переменная для инициализации
-        LuceneMorphology tempMorph = null;
+        // Временные переменные для инициализации +1 переменной
+        LuceneMorphology tempRussianMorph = null;
+        LuceneMorphology tempEnglishMorph = null;
         try {
-            tempMorph = new RussianLuceneMorphology(); // Создание экземпляра русской морфологии
+            tempRussianMorph = new RussianLuceneMorphology(); // создание экземпляра русской морфологии
+            tempEnglishMorph = new EnglishLuceneMorphology(); // создание экземпляра английской морфологии
         } catch (IOException e) {
             log.error("Failed to initialize LuceneMorphology", e);
         }
-        this.luceneMorph = tempMorph;
+        this.russianMorph = tempRussianMorph;
+        this.englishMorph = tempEnglishMorph;
     }
 
     // Метод для извлечения лемм из текста
     // Map (ключ - лемма, значение - количество вхождений)
     public Map<String, Integer> collectLemmas(String text) {
         // Проверяем инициализирована ли морфология
-        if (luceneMorph == null) {
+        if (russianMorph == null || englishMorph == null) {
             log.error("Morphology analyzer not initialized");
             return Collections.emptyMap();
         }
@@ -42,37 +54,38 @@ public class LemmaService {
             return Collections.emptyMap();
         }
 
-        // Очищаем текст: приводим к нижнему регистру, убираем лишние символы
-        String cleanedText = cleanText(text);
         Map<String, Integer> lemmaFrequencies = new HashMap<>();
 
-        // Разбиваем текст на слова по пробелам
-        for (String word : cleanedText.split("\\s+")) {
-            if (word.isBlank()) continue; // Пропускаем пустые слова
-            processWord(word, lemmaFrequencies); // Обрабатываем каждое слово
+        // Разбиваем текст на слова и обрабатываем каждое слово
+        String[] words = text.toLowerCase()
+                .replaceAll("[^a-zA-Zа-яё\\s]", " ")
+                .replaceAll("\\s+", " ")
+                .trim()
+                .split("\\s+");
+
+        // Проверка на минимальную длину леммы
+        for (String word : words) {
+            if (word.isBlank() || word.length() < MIN_LEMMA_LENGTH) continue;
+            processWord(word, lemmaFrequencies);
         }
 
         return lemmaFrequencies;
     }
 
-    // Метод для очистки текста
-    private String cleanText(String text) {
-        return text.toLowerCase() // Приводим текст к нижнему регистру
-                .replaceAll("[^а-яё\\s]", " ") // Заменяем все не-буквы на пробелы
-                .replaceAll("\\s+", " ") // Заменяем множественные пробелы на один
-                .trim(); // Убираем пробелы в начале и конце
-    }
-
     // Метод для обработки одного слова
     private void processWord(String word, Map<String, Integer> lemmaFrequencies) {
         try {
-            List<String> normalForms = luceneMorph.getNormalForms(word); // Получаем нормальные формы слова (леммы)
-            if (normalForms.isEmpty()) return; // Если нормальных форм нет, выходим
+            String language = detectLanguage(word);
+            LuceneMorphology morphology = getMorphologyForLanguage(language);
+            Set<String> excludePos = getExcludePosForLanguage(language);
 
-            String lemma = normalForms.get(0); // Берем первую нормальную форму (основную лемму)
-            // Проверяем валидность леммы
-            if (isValidLemma(lemma, word)) {
-                // Увеличиваем счетчик для этой леммы
+            if (morphology == null) return;
+
+            List<String> normalForms = morphology.getNormalForms(word);
+            if (normalForms.isEmpty()) return;
+
+            String lemma = normalForms.get(0);
+            if (isValidLemma(lemma, word, morphology, excludePos)) {
                 lemmaFrequencies.put(lemma, lemmaFrequencies.getOrDefault(lemma, 0) + 1);
             }
         } catch (Exception e) {
@@ -80,18 +93,58 @@ public class LemmaService {
         }
     }
 
-    // Метод для проверки валидности леммы
-    private boolean isValidLemma(String lemma, String originalWord) {
-        // Проверка длины леммы
+    // Метод определения языка слова
+    private String detectLanguage(String word) {
+        boolean hasRussian = RUSSIAN_PATTERN.matcher(word).find();
+        boolean hasEnglish = ENGLISH_PATTERN.matcher(word).find();
+
+        if (hasRussian && !hasEnglish) return "russian";
+        if (hasEnglish && !hasRussian) return "english";
+        if (hasRussian && hasEnglish) return "russian"; // Приоритет русскому
+
+        return "unknown";
+    }
+
+    // Получение морфологии по языку
+    private LuceneMorphology getMorphologyForLanguage(String language) {
+        return switch (language) {
+            case "russian" -> russianMorph;
+            case "english" -> englishMorph;
+            default -> null;
+        };
+    }
+
+    // Получение исключаемых частей речи по языку
+    private Set<String> getExcludePosForLanguage(String language) {
+        return switch (language) {
+            case "russian" -> RUSSIAN_EXCLUDE_POS;
+            case "english" -> ENGLISH_EXCLUDE_POS;
+            default -> Collections.emptySet();
+        };
+    }
+
+    // Метод проверки валидности леммы с поддержкой языка
+    private boolean isValidLemma(String lemma, String originalWord,
+                                 LuceneMorphology morphology, Set<String> excludePos) {
         if (lemma.length() < MIN_LEMMA_LENGTH) return false;
 
         try {
             // Получение морфологической информации о слове
-            return luceneMorph.getMorphInfo(originalWord).stream()
-                    .noneMatch(info -> EXCLUDE_POS.stream().anyMatch(info::contains)); // Проверяем что ни одна часть речи не входит в исключения
+            return morphology.getMorphInfo(originalWord).stream()
+                    .noneMatch(info -> excludePos.stream().anyMatch(info::contains)); // Проверяем что ни одна часть речи не входит в исключения
         } catch (Exception e) {
             log.debug("Error checking lemma validity", e);
             return false;
         }
+    }
+
+    // Метод для определения языка слова (для использования в поиске)
+    public String getWordLanguage(String word) {
+        return detectLanguage(word);
+    }
+
+    // Метод для получения морфологии по языку
+    public LuceneMorphology getMorphologyByLanguage(String language) {
+        return getMorphologyForLanguage(language);
     }
 }

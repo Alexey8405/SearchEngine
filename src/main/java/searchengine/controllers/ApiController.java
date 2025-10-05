@@ -75,8 +75,6 @@ public class ApiController {
         }
 
         SearchResponse response = searchService.search(query, site, offset, limit);
-        return response.isResult()
-                ? ResponseEntity.ok(response)
-                : ResponseEntity.ok(response);
+        return ResponseEntity.ok(response);
     }
 }

@@ -17,11 +17,13 @@ spring:
 
 indexing-settings:
   sites:
-    - url: https://lenta.ru
-      name: Лента.ру
+#    - url: https://lenta.ru
+#      name: Лента.ру
     - url: https://www.skillbox.ru
       name: Skillbox
-    - url: https://www.playback.ru
-      name: PlayBack.Ru
+#    - url: https://www.playback.ru
+#      name: PlayBack.Ru
+    - url: https://sendel.ru
+      name: Sendel
   user-agent: YourSearchBot
   referrer: https://www.google.com

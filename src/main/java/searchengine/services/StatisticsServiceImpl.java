@@ -8,7 +8,6 @@ import searchengine.dto.statistics.*;
 import searchengine.model.Site;
 import searchengine.repositories.*;
 
-import java.time.ZoneId;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -52,10 +51,10 @@ public class StatisticsServiceImpl implements StatisticsService {
                 site.getUrl(),
                 site.getName(),
                 site.getStatus().name(),
-                site.getStatusTime().atZone(ZoneId.systemDefault()).toEpochSecond(), // Время статуса в секундах
-                site.getLastError(), // Текст последней ошибки (если есть)
-                (int) pageRepository.countBySite(site), // Количество страниц на сайте
-                lemmaRepository.countBySite(site) // Количество лемм на сайте
+                site.getStatusTime(), // LocalDateTime напрямую из базы
+                site.getLastError(),
+                (int) pageRepository.countBySite(site),
+                lemmaRepository.countBySite(site)
         );
     }
 }
