@@ -19,8 +19,14 @@ indexing-settings:
   sites:
 #    - url: https://lenta.ru
 #      name: Лента.ру
-    - url: https://www.skillbox.ru
-      name: Skillbox
+#    - url: https://www.skillbox.ru
+#      name: Skillbox
+    - url: https://nikoartgallery.com/news/all
+      name: Niko art gallery
+    - url: https://www.svetlovka.ru/
+      name: Библиотека им.Светлова
+    - url: http://radiomv.ru/actions/
+      name: RadioMV
 #    - url: https://www.playback.ru
 #      name: PlayBack.Ru
     - url: https://sendel.ru

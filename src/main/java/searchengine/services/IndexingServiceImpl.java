@@ -35,53 +35,156 @@ public class IndexingServiceImpl implements IndexingService {
     private final SitesList sitesList;
     private final PlatformTransactionManager transactionManager; // Для управления транзакциями
 
-    private ExecutorService executorService; // Для управления пулом потоков, не final, устанавливается во время работы
+//    private ExecutorService executorService; // Для управления пулом потоков, не final, устанавливается во время работы
+    private ForkJoinPool forkJoinPool;
     private final AtomicBoolean indexingRunning = new AtomicBoolean(false);; // Флаг (запущена ли индексация?) + атомик для потокобезопасности
     private final Map<String, Future<?>> siteTasks = new ConcurrentHashMap<>(); // Мапа для отслеживания задач по сайтам (Ключ: URL сайта, Значение: Future<?> - объект представляющий задачу)
     private final Map<String, Object> siteLocks = new ConcurrentHashMap<>(); // Мапа для блокировок по сайтам (Ключ: URL сайта, Значение: Object - объект для синхронизации)
 
-    // synchronized - только один поток может выполнять этот метод одновременно
+//    // synchronized - только один поток может выполнять этот метод одновременно
+//    @Override
+//    public synchronized boolean startIndexing() {
+//        // Используем compareAndSet для атомарной проверки и установки
+//        if (!indexingRunning.compareAndSet(false, true)) {
+//            log.warn("Indexing already running");
+//            return false;
+//        }
+//        // Создаем пул потоков с количеством потоков = количеству сайтов
+//        executorService = Executors.newFixedThreadPool(sitesList.getSites().size());
+//
+//        sitesList.getSites().forEach(siteConfig -> {
+//            // Добавляем объект для синхронизации в карту блокировок (если ключа еще нет - putIfAbsent)
+//            siteLocks.putIfAbsent(siteConfig.getUrl(), new Object());
+//            // Запускаем задачу индексации сайта в отдельном потоке
+//            Future<?> future = executorService.submit(() -> indexSite(siteConfig));
+//            // Сохраняем Future задачи в карту задач
+//            siteTasks.put(siteConfig.getUrl(), future);
+//        });
+//
+//        log.info("Indexing started for {} sites", sitesList.getSites().size());
+//        return true;
+//    }
+//
+//    @Override
+//    public synchronized boolean stopIndexing() {
+//        // ИСПРАВЛЕНО: Используем getAndSet для атомарной проверки и установки
+//        if (!indexingRunning.getAndSet(false)) {
+//            log.warn("No active indexing to stop");
+//            return false;
+//        }
+//
+//        // Остановка всех потоков
+//        if (executorService != null) {
+//            executorService.shutdownNow();
+//        }
+//
+//        // Создание TransactionTemplate для выполнения кода в транзакции
+//        TransactionTemplate transactionTemplate = new TransactionTemplate(transactionManager);
+//        transactionTemplate.execute(status -> {
+//            siteRepository.findAllByStatus(SiteStatus.INDEXING).forEach(site -> {
+//                site.setStatus(SiteStatus.FAILED);
+//                site.setLastError("Индексация остановлена пользователем");
+//                site.setStatusTime(LocalDateTime.now());
+//                siteRepository.save(site);
+//            });
+//            return null;
+//        });
+//
+//        log.info("Indexing stopped by user");
+//        return true;
+//    }
+
     @Override
     public synchronized boolean startIndexing() {
-        // Используем compareAndSet для атомарной проверки и установки
         if (!indexingRunning.compareAndSet(false, true)) {
             log.warn("Indexing already running");
             return false;
         }
-        // Создаем пул потоков с количеством потоков = количеству сайтов
-        executorService = Executors.newFixedThreadPool(sitesList.getSites().size());
+
+        // Создаем ForkJoinPool
+        forkJoinPool = new ForkJoinPool();
 
         sitesList.getSites().forEach(siteConfig -> {
-            // Добавляем объект для синхронизации в карту блокировок (если ключа еще нет - putIfAbsent)
             siteLocks.putIfAbsent(siteConfig.getUrl(), new Object());
-            // Запускаем задачу индексации сайта в отдельном потоке
-            Future<?> future = executorService.submit(() -> indexSite(siteConfig));
-            // Сохраняем Future задачи в карту задач
-            siteTasks.put(siteConfig.getUrl(), future);
+
+            // Запускаем индексацию для каждого сайта
+            startSiteIndexing(siteConfig);
         });
 
-        log.info("Indexing started for {} sites", sitesList.getSites().size());
+        log.info("Indexing started for {} sites using Fork-Join", sitesList.getSites().size());
         return true;
+    }
+
+    private void startSiteIndexing(SiteConfig config) {
+        try {
+            // Подготавливаем сайт (старый метод indexSite без логики обхода страниц)
+            Site site = executeInTransaction(() -> {
+                Site s = siteRepository.findByUrl(config.getUrl())
+                        .orElseGet(() -> createNewSite(config));
+                updateSiteStatus(s, searchengine.model.SiteStatus.INDEXING, null);
+                clearSiteData(s);
+                return s;
+            });
+
+            // Создаем множество для отслеживания посещенных URL
+            Set<String> visitedUrls = ConcurrentHashMap.newKeySet();
+            visitedUrls.add("/"); // Начинаем с корневой страницы
+
+            // Создаем и запускаем задачу для корневой страницы
+            SiteCrawler rootTask = new SiteCrawler(
+                    site, "/", sitesList, pageRepository, lemmaRepository,
+                    indexRepository, siteRepository, lemmaService,
+                    visitedUrls, indexingRunning
+            );
+
+            Future<?> future = forkJoinPool.submit(rootTask);
+            siteTasks.put(config.getUrl(), future);
+
+            log.info("Started indexing site: {}", config.getUrl());
+
+        } catch (Exception e) {
+            log.error("Failed to start indexing for site: {}", config.getUrl(), e);
+            // Обновляем статус сайта на FAILED
+            executeInTransaction(() -> {
+                Site site = siteRepository.findByUrl(config.getUrl()).orElse(null);
+                if (site != null) {
+                    updateSiteStatus(site, searchengine.model.SiteStatus.FAILED,
+                            "Ошибка запуска индексации: " + e.getMessage());
+                }
+                return null;
+            });
+        }
+    }
+
+    // Сохраняем старый метод indexSite, но убираем из него логику обхода страниц
+    protected void indexSite(SiteConfig config) {
+        // Теперь этот метод только подготавливает сайт и запускает Fork-Join задачи
+        startSiteIndexing(config);
     }
 
     @Override
     public synchronized boolean stopIndexing() {
-        // ИСПРАВЛЕНО: Используем getAndSet для атомарной проверки и установки
         if (!indexingRunning.getAndSet(false)) {
             log.warn("No active indexing to stop");
             return false;
         }
 
-        // Остановка всех потоков
-        if (executorService != null) {
-            executorService.shutdownNow();
+        if (forkJoinPool != null) {
+            forkJoinPool.shutdownNow();
+            try {
+                if (!forkJoinPool.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                    forkJoinPool.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                forkJoinPool.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
         }
 
-        // Создание TransactionTemplate для выполнения кода в транзакции
         TransactionTemplate transactionTemplate = new TransactionTemplate(transactionManager);
         transactionTemplate.execute(status -> {
-            siteRepository.findAllByStatus(SiteStatus.INDEXING).forEach(site -> {
-                site.setStatus(SiteStatus.FAILED);
+            siteRepository.findAllByStatus(searchengine.model.SiteStatus.INDEXING).forEach(site -> {
+                site.setStatus(searchengine.model.SiteStatus.FAILED);
                 site.setLastError("Индексация остановлена пользователем");
                 site.setStatusTime(LocalDateTime.now());
                 siteRepository.save(site);
@@ -146,80 +249,80 @@ public class IndexingServiceImpl implements IndexingService {
     }
 
     // Индексация одного сайта
-    protected void indexSite(SiteConfig config) {
-        // Выполняем в транзакции: находим или создаем сайт, обновляем статус, очищаем данные, возвращаем сайт
-        Site site = executeInTransaction(() -> {
-            Site s = siteRepository.findByUrl(config.getUrl())
-                    .orElseGet(() -> createNewSite(config));
-            updateSiteStatus(s, SiteStatus.INDEXING, null);
-            clearSiteData(s);
-            return s;
-        });
-
-        try {
-            // Создание очереди URL для обхода (начинается с корневой страницы)
-            Queue<String> urlQueue = new ConcurrentLinkedQueue<>();
-            // Множество посещенных URL (чтобы не ходить по одним и тем же страницам)
-            Set<String> visitedUrls = ConcurrentHashMap.newKeySet();
-
-            // Добавляем корневую страницу в очередь
-            urlQueue.add("/");
-            // Добавляем корневую страницу в посещенные
-            visitedUrls.add("/");
-
-            // Пока есть URL в очереди и индексация не остановлена
-            while (!urlQueue.isEmpty() && indexingRunning.get()) {
-                String path = urlQueue.poll(); // Берем следующий URL из очереди
-
-                // Пытаемся проиндексировать страницу в транзакции с повторами
-                // Индексируем страницу
-                // Если ошибка - логируем и возвращаем false
-                boolean success = Boolean.TRUE.equals(executeInTransactionWithRetry(() -> {
-                    try {
-                        indexPage(site, path); // Индексируем страницу
-                        return true;
-                    } catch (Exception e) {
-                        log.error("Error processing page: {}", path, e); // Если ошибка - логируем и возвращаем false
-                        return false;
-                    }
-                }, 3, 1000)); // 3 попытки с задержкой 1000 мс
-
-                if (!success) continue; // Если не удалось обработать страницу, переходим к следующей
-
-                try {
-                    // Извлекаем ссылки со страницы
-                    List<String> newLinks = extractLinksFromPage(site.getUrl() + path);
-                    for (String link : newLinks) {
-                        // Если еще не посещали эту ссылку
-                        if (!visitedUrls.contains(link)) {
-                            visitedUrls.add(link); // Добавляем в посещенные
-                            urlQueue.add(link); // Добавляем в очередь для обработки
-                        }
-                    }
-
-                    Thread.sleep(500); // Задержка для избежания перегрузки
-                } catch (Exception e) {
-                    log.error("Error extracting links: {}", path, e); // Если ошибка при извлечении ссылок, логируем и продолжаем
-                }
-            }
-
-            // Если индексация не была остановлена вручную
-            if (indexingRunning.get()) {
-                // Выполнение в транзакции: обновляем статус на INDEXED
-                executeInTransaction(() -> {
-                    updateSiteStatus(site, SiteStatus.INDEXED, null);
-                    return null;
-                });
-                log.info("Site indexed successfully: {}", site.getUrl());
-            }
-        } catch (Exception e) {
-            executeInTransaction(() -> {
-                updateSiteStatus(site, SiteStatus.FAILED, "Ошибка индексации: " + e.getMessage());
-                return null;
-            });
-            log.error("Site indexing failed: {}", site.getUrl(), e);
-        }
-    }
+//    protected void indexSite(SiteConfig config) {
+//        // Выполняем в транзакции: находим или создаем сайт, обновляем статус, очищаем данные, возвращаем сайт
+//        Site site = executeInTransaction(() -> {
+//            Site s = siteRepository.findByUrl(config.getUrl())
+//                    .orElseGet(() -> createNewSite(config));
+//            updateSiteStatus(s, SiteStatus.INDEXING, null);
+//            clearSiteData(s);
+//            return s;
+//        });
+//
+//        try {
+//            // Создание очереди URL для обхода (начинается с корневой страницы)
+//            Queue<String> urlQueue = new ConcurrentLinkedQueue<>();
+//            // Множество посещенных URL (чтобы не ходить по одним и тем же страницам)
+//            Set<String> visitedUrls = ConcurrentHashMap.newKeySet();
+//
+//            // Добавляем корневую страницу в очередь
+//            urlQueue.add("/");
+//            // Добавляем корневую страницу в посещенные
+//            visitedUrls.add("/");
+//
+//            // Пока есть URL в очереди и индексация не остановлена
+//            while (!urlQueue.isEmpty() && indexingRunning.get()) {
+//                String path = urlQueue.poll(); // Берем следующий URL из очереди
+//
+//                // Пытаемся проиндексировать страницу в транзакции с повторами
+//                // Индексируем страницу
+//                // Если ошибка - логируем и возвращаем false
+//                boolean success = Boolean.TRUE.equals(executeInTransactionWithRetry(() -> {
+//                    try {
+//                        indexPage(site, path); // Индексируем страницу
+//                        return true;
+//                    } catch (Exception e) {
+//                        log.error("Error processing page: {}", path, e); // Если ошибка - логируем и возвращаем false
+//                        return false;
+//                    }
+//                }, 3, 1000)); // 3 попытки с задержкой 1000 мс
+//
+//                if (!success) continue; // Если не удалось обработать страницу, переходим к следующей
+//
+//                try {
+//                    // Извлекаем ссылки со страницы
+//                    List<String> newLinks = extractLinksFromPage(site.getUrl() + path);
+//                    for (String link : newLinks) {
+//                        // Если еще не посещали эту ссылку
+//                        if (!visitedUrls.contains(link)) {
+//                            visitedUrls.add(link); // Добавляем в посещенные
+//                            urlQueue.add(link); // Добавляем в очередь для обработки
+//                        }
+//                    }
+//
+//                    Thread.sleep(500); // Задержка для избежания перегрузки
+//                } catch (Exception e) {
+//                    log.error("Error extracting links: {}", path, e); // Если ошибка при извлечении ссылок, логируем и продолжаем
+//                }
+//            }
+//
+//            // Если индексация не была остановлена вручную
+//            if (indexingRunning.get()) {
+//                // Выполнение в транзакции: обновляем статус на INDEXED
+//                executeInTransaction(() -> {
+//                    updateSiteStatus(site, SiteStatus.INDEXED, null);
+//                    return null;
+//                });
+//                log.info("Site indexed successfully: {}", site.getUrl());
+//            }
+//        } catch (Exception e) {
+//            executeInTransaction(() -> {
+//                updateSiteStatus(site, SiteStatus.FAILED, "Ошибка индексации: " + e.getMessage());
+//                return null;
+//            });
+//            log.error("Site indexing failed: {}", site.getUrl(), e);
+//        }
+//    }
 
     // Метод для извлечения ссылок со страницы
     private List<String> extractLinksFromPage(String url) throws IOException {
